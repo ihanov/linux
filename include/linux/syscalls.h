@@ -1164,6 +1164,9 @@ asmlinkage long sys_ni_syscall(void);
 
 asmlinkage long sys_ni_posix_timers(void);
 
+/* New dummy syscall */
+asmlinkage long sys_copy_file(const char __user *src, const char __user *dst);
+
 /*
  * Kernel code should not call syscalls (i.e., sys_xyzyyz()) directly.
  * Instead, use one of the functions which work equivalently, such as

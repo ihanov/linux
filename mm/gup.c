@@ -915,19 +915,19 @@ unmap:
  * to 0 and -EBUSY returned.
  */
 static int faultin_page(struct vm_area_struct *vma,
-		unsigned long address, unsigned int *flags, bool unshare,
+		unsigned long address, unsigned int flags, bool unshare,
 		int *locked)
 {
 	unsigned int fault_flags = 0;
 	vm_fault_t ret;
 
-	if (*flags & FOLL_NOFAULT)
+	if (flags & FOLL_NOFAULT)
 		return -EFAULT;
-	if (*flags & FOLL_WRITE)
+	if (flags & FOLL_WRITE)
 		fault_flags |= FAULT_FLAG_WRITE;
-	if (*flags & FOLL_REMOTE)
+	if (flags & FOLL_REMOTE)
 		fault_flags |= FAULT_FLAG_REMOTE;
-	if (*flags & FOLL_UNLOCKABLE) {
+	if (flags & FOLL_UNLOCKABLE) {
 		fault_flags |= FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_KILLABLE;
 		/*
 		 * FAULT_FLAG_INTERRUPTIBLE is opt-in. GUP callers must set
@@ -935,12 +935,12 @@ static int faultin_page(struct vm_area_struct *vma,
 		 * That's because some callers may not be prepared to
 		 * handle early exits caused by non-fatal signals.
 		 */
-		if (*flags & FOLL_INTERRUPTIBLE)
+		if (flags & FOLL_INTERRUPTIBLE)
 			fault_flags |= FAULT_FLAG_INTERRUPTIBLE;
 	}
-	if (*flags & FOLL_NOWAIT)
+	if (flags & FOLL_NOWAIT)
 		fault_flags |= FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_RETRY_NOWAIT;
-	if (*flags & FOLL_TRIED) {
+	if (flags & FOLL_TRIED) {
 		/*
 		 * Note: FAULT_FLAG_ALLOW_RETRY and FAULT_FLAG_TRIED
 		 * can co-exist
@@ -974,7 +974,7 @@ static int faultin_page(struct vm_area_struct *vma,
 	}
 
 	if (ret & VM_FAULT_ERROR) {
-		int err = vm_fault_to_errno(ret, *flags);
+		int err = vm_fault_to_errno(ret, flags);
 
 		if (err)
 			return err;
@@ -1236,7 +1236,7 @@ retry:
 
 		page = follow_page_mask(vma, start, foll_flags, &ctx);
 		if (!page || PTR_ERR(page) == -EMLINK) {
-			ret = faultin_page(vma, start, &foll_flags,
+			ret = faultin_page(vma, start, foll_flags,
 					   PTR_ERR(page) == -EMLINK, locked);
 			switch (ret) {
 			case 0:

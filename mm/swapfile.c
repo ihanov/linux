@@ -210,18 +210,34 @@ static int discard_swap(struct swap_info_struct *si)
 static struct swap_extent *
 offset_to_swap_extent(struct swap_info_struct *sis, unsigned long offset)
 {
-	struct swap_extent *se;
+	struct swap_extent *se = READ_ONCE(sis->cached_se);
 	struct rb_node *rb;
+
+	if (se &&
+	    (offset >= se->start_page &&
+	     offset < se->start_page + se->nr_pages))
+		return se;
 
 	rb = sis->swap_extent_root.rb_node;
 	while (rb) {
 		se = rb_entry(rb, struct swap_extent, rb_node);
-		if (offset < se->start_page)
+		if (offset < se->start_page) {
 			rb = rb->rb_left;
-		else if (offset >= se->start_page + se->nr_pages)
+		} else if (offset >= se->start_page + se->nr_pages) {
 			rb = rb->rb_right;
-		else
+		} else {
+			/*
+			 * TODO: In case of concurrent access to extent tree,
+			 *       there's a chance that different processes
+			 *       can try to access long-distant extents, i.e.
+			 *       will each time modify the last cached value,
+			 *       which can result into slow down.
+			 *
+			 *       Maybe use per CPU variables here.
+			 */
+			WRITE_ONCE(sis->cached_se, se);
 			return se;
+		}
 	}
 	/* It *must* be present */
 	BUG();
@@ -3129,6 +3145,7 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 		error = nr_extents;
 		goto bad_swap_unlock_inode;
 	}
+	p->cached_se = NULL;
 
 	if ((swap_flags & SWAP_FLAG_DISCARD) &&
 	    p->bdev && bdev_max_discard_sectors(p->bdev)) {

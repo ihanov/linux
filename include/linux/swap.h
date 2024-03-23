@@ -182,6 +182,12 @@ struct sysinfo;
 struct writeback_control;
 struct zone;
 
+#define SE_ITERATOR_START(name, __swap_info, start) \
+	XA_STATE(name, &__swap_info->swap_extents, start)
+
+#define SE_ITERATOR(name, __swap_info) \
+	SE_ITERATOR_START(name, __swap_info, 0)
+
 /*
  * A swap extent maps a range of a swapfile's PAGE_SIZE pages onto a range of
  * disk blocks.  A rbtree of swap extents maps the entire swapfile (Where the
@@ -191,7 +197,6 @@ struct zone;
  * We always assume that blocks are of size PAGE_SIZE.
  */
 struct swap_extent {
-	struct rb_node rb_node;
 	pgoff_t start_page;
 	pgoff_t nr_pages;
 	sector_t start_block;
@@ -297,7 +302,7 @@ struct swap_info_struct {
 	unsigned int cluster_nr;	/* countdown to next cluster search */
 	unsigned int __percpu *cluster_next_cpu; /*percpu index for next allocation */
 	struct percpu_cluster __percpu *percpu_cluster; /* per cpu's swap location */
-	struct rb_root swap_extent_root;/* root of the swap extent rbtree */
+	struct xarray swap_extents;	/* root of the swap extent rbtree */
 	struct file *bdev_file;		/* open handle of the bdev */
 	struct block_device *bdev;	/* swap device or bdev of swap file */
 	struct file *swap_file;		/* seldom referenced */

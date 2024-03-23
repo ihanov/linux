@@ -159,16 +159,15 @@ static int __try_to_reclaim_swap(struct swap_info_struct *si,
 	return ret;
 }
 
-static inline struct swap_extent *first_se(struct swap_info_struct *sis)
+static inline struct swap_extent *first_se(struct xa_state *xas)
 {
-	struct rb_node *rb = rb_first(&sis->swap_extent_root);
-	return rb_entry(rb, struct swap_extent, rb_node);
+	xas_set(xas, 0);
+	return xas_load(xas);
 }
 
-static inline struct swap_extent *next_se(struct swap_extent *se)
+static inline struct swap_extent *next_se(struct xa_state *xas)
 {
-	struct rb_node *rb = rb_next(&se->rb_node);
-	return rb ? rb_entry(rb, struct swap_extent, rb_node) : NULL;
+	return xas_next_entry(xas, swapfile_maximum_size - 1);
 }
 
 /*
@@ -181,9 +180,10 @@ static int discard_swap(struct swap_info_struct *si)
 	sector_t start_block;
 	sector_t nr_blocks;
 	int err = 0;
+	SE_ITERATOR(sei, si);
 
 	/* Do not discard the swap header page! */
-	se = first_se(si);
+	se = first_se(&sei);
 	start_block = (se->start_block + 1) << (PAGE_SHIFT - 9);
 	nr_blocks = ((sector_t)se->nr_pages - 1) << (PAGE_SHIFT - 9);
 	if (nr_blocks) {
@@ -194,7 +194,7 @@ static int discard_swap(struct swap_info_struct *si)
 		cond_resched();
 	}
 
-	for (se = next_se(se); se; se = next_se(se)) {
+	for (se = next_se(&sei); se; se = next_se(&sei)) {
 		start_block = se->start_block << (PAGE_SHIFT - 9);
 		nr_blocks = (sector_t)se->nr_pages << (PAGE_SHIFT - 9);
 
@@ -211,21 +211,11 @@ static int discard_swap(struct swap_info_struct *si)
 static struct swap_extent *
 offset_to_swap_extent(struct swap_info_struct *sis, unsigned long offset)
 {
-	struct swap_extent *se;
-	struct rb_node *rb;
+	struct swap_extent *se = xa_load(&sis->swap_extents, offset);
 
-	rb = sis->swap_extent_root.rb_node;
-	while (rb) {
-		se = rb_entry(rb, struct swap_extent, rb_node);
-		if (offset < se->start_page)
-			rb = rb->rb_left;
-		else if (offset >= se->start_page + se->nr_pages)
-			rb = rb->rb_right;
-		else
-			return se;
-	}
-	/* It *must* be present */
-	BUG();
+	if (unlikely(!se))
+		BUG(); /* It *must* be present */
+	return se;
 }
 
 sector_t swap_folio_sector(struct folio *folio)
@@ -249,6 +239,7 @@ static void discard_swap_cluster(struct swap_info_struct *si,
 				 pgoff_t start_page, pgoff_t nr_pages)
 {
 	struct swap_extent *se = offset_to_swap_extent(si, start_page);
+	SE_ITERATOR_START(sei, si, se->start_page);
 
 	while (nr_pages) {
 		pgoff_t offset = start_page - se->start_page;
@@ -266,7 +257,7 @@ static void discard_swap_cluster(struct swap_info_struct *si,
 					nr_blocks, GFP_NOIO))
 			break;
 
-		se = next_se(se);
+		se = next_se(&sei);
 	}
 }
 
@@ -1668,12 +1659,13 @@ int swap_type_of(dev_t device, sector_t offset)
 	spin_lock(&swap_lock);
 	for (type = 0; type < nr_swapfiles; type++) {
 		struct swap_info_struct *sis = swap_info[type];
+		SE_ITERATOR(sei, sis);
 
 		if (!(sis->flags & SWP_WRITEOK))
 			continue;
 
 		if (device == sis->bdev->bd_dev) {
-			struct swap_extent *se = first_se(sis);
+			struct swap_extent *se = first_se(&sei);
 
 			if (se->start_block == offset) {
 				spin_unlock(&swap_lock);
@@ -2180,13 +2172,24 @@ static void drain_mmlist(void)
  */
 static void destroy_swap_extents(struct swap_info_struct *sis)
 {
-	while (!RB_EMPTY_ROOT(&sis->swap_extent_root)) {
-		struct rb_node *rb = sis->swap_extent_root.rb_node;
-		struct swap_extent *se = rb_entry(rb, struct swap_extent, rb_node);
+	unsigned long index;
+	struct swap_extent *se;
 
-		rb_erase(rb, &sis->swap_extent_root);
+	xa_for_each_range(&sis->swap_extents, index, se, 0, swapfile_maximum_size - 1) {
+		/*
+		 * TODO: XArray may return "unrelated"
+		 *	 entry, i.e. it doesn't contain swap_extent
+		 *	 structure, but since swap_extents tree uses
+		 *	 only ranges, this entry's required by XArray itself, so
+		 *	 skip it, otherwise we could tell slab allocator
+		 *	 to free something important (or even worse -
+		 *	 something unknown).
+		 */
+		if (se != xa_erase(&sis->swap_extents, se->start_page))
+			continue;
 		kfree(se);
 	}
+	xa_destroy(&sis->swap_extents);
 
 	if (sis->flags & SWP_ACTIVATED) {
 		struct file *swap_file = sis->swap_file;
@@ -2201,46 +2204,27 @@ static void destroy_swap_extents(struct swap_info_struct *sis)
 /*
  * Add a block range (and the corresponding page range) into this swapdev's
  * extent tree.
- *
- * This function rather assumes that it is called in ascending page order.
  */
 int
 add_swap_extent(struct swap_info_struct *sis, unsigned long start_page,
 		unsigned long nr_pages, sector_t start_block)
 {
-	struct rb_node **link = &sis->swap_extent_root.rb_node, *parent = NULL;
-	struct swap_extent *se;
-	struct swap_extent *new_se;
+	struct swap_extent *se, *new_se;
 
-	/*
-	 * place the new node at the right most since the
-	 * function is called in ascending page order.
-	 */
-	while (*link) {
-		parent = *link;
-		link = &parent->rb_right;
-	}
-
-	if (parent) {
-		se = rb_entry(parent, struct swap_extent, rb_node);
-		BUG_ON(se->start_page + se->nr_pages != start_page);
-		if (se->start_block + se->nr_pages == start_block) {
-			/* Merge it */
-			se->nr_pages += nr_pages;
-			return 0;
-		}
-	}
-
-	/* No merge, insert a new extent. */
-	new_se = kmalloc(sizeof(*se), GFP_KERNEL);
+	new_se = kmalloc(sizeof(struct swap_extent), GFP_KERNEL);
 	if (new_se == NULL)
 		return -ENOMEM;
 	new_se->start_page = start_page;
 	new_se->nr_pages = nr_pages;
 	new_se->start_block = start_block;
 
-	rb_link_node(&new_se->rb_node, parent, link);
-	rb_insert_color(&new_se->rb_node, &sis->swap_extent_root);
+	se = xa_store_range(&sis->swap_extents, start_page, start_page + nr_pages - 1,
+			    new_se, GFP_KERNEL);
+	if (unlikely(xa_is_err(se))) {
+		kfree(new_se);
+		return xa_err(se);
+	}
+
 	return 1;
 }
 EXPORT_SYMBOL_GPL(add_swap_extent);
@@ -2763,7 +2747,6 @@ static struct swap_info_struct *alloc_swap_info(void)
 		 * would be relying on p->type to remain valid.
 		 */
 	}
-	p->swap_extent_root = RB_ROOT;
 	plist_node_init(&p->list, 0);
 	for_each_node(i)
 		plist_node_init(&p->avail_lists[i], 0);
@@ -3030,6 +3013,7 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 		return PTR_ERR(p);
 
 	INIT_WORK(&p->discard_work, swap_discard_work);
+	xa_init(&p->swap_extents);
 
 	name = getname(specialfile);
 	if (IS_ERR(name)) {

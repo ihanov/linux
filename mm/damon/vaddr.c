@@ -300,11 +300,17 @@ static void damon_va_update(struct damon_ctx *ctx)
 static int damon_mkold_pmd_entry(pmd_t *pmd, unsigned long addr,
 		unsigned long next, struct mm_walk *walk)
 {
+	struct vm_area_struct *vma = walk->vma;
+	struct damon_region *r = walk->private;
+	unsigned long pmd_start = addr & PMD_MASK;
+	unsigned long pmd_end   = pmd_start + PMD_SIZE;
 	pte_t *pte;
-	pmd_t pmde;
 	spinlock_t *ptl;
 
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	if (pmd_trans_huge(pmdp_get(pmd))) {
+		pmd_t pmde;
+
 		ptl = pmd_lock(walk->mm, pmd);
 		pmde = pmdp_get(pmd);
 
@@ -314,13 +320,28 @@ static int damon_mkold_pmd_entry(pmd_t *pmd, unsigned long addr,
 		}
 
 		if (pmd_trans_huge(pmde)) {
-			damon_pmdp_mkold(pmd, walk->vma, addr);
+			damon_pmdp_mkold(pmd, vma, addr);
 			spin_unlock(ptl);
 			return 0;
 		}
 		spin_unlock(ptl);
 	}
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 
+	/*
+	 * If DAMON's region has the whole PMD, then we don't
+	 * need to check PTE, we can only check access bit in
+	 * PMD, because any translation tried on that PMD will
+	 * indicate access to any of PTEs inside the range.
+	 */
+	if (!(vma->vm_start <= pmd_start && vma->vm_end >= pmd_end))
+		goto mkold_pte;
+
+	r->last_pmd = pmd;
+	damon_pmdp_mkold(pmd, vma, addr);
+
+	return 0;
+mkold_pte:
 	pte = pte_offset_map_lock(walk->mm, pmd, addr, &ptl);
 	if (!pte) {
 		walk->action = ACTION_AGAIN;
@@ -328,7 +349,7 @@ static int damon_mkold_pmd_entry(pmd_t *pmd, unsigned long addr,
 	}
 	if (!pte_present(ptep_get(pte)))
 		goto out;
-	damon_ptep_mkold(pte, walk->vma, addr);
+	damon_ptep_mkold(pte, vma, addr);
 out:
 	pte_unmap_unlock(pte, ptl);
 	return 0;
@@ -393,10 +414,10 @@ static const struct mm_walk_ops damon_mkold_ops = {
 	.walk_lock = PGWALK_RDLOCK,
 };
 
-static void damon_va_mkold(struct mm_struct *mm, unsigned long addr)
+static void damon_va_mkold(struct mm_struct *mm, struct damon_region *r, unsigned long addr)
 {
 	mmap_read_lock(mm);
-	walk_page_range(mm, addr, addr + 1, &damon_mkold_ops, NULL);
+	walk_page_range(mm, addr, addr + 1, &damon_mkold_ops, r);
 	mmap_read_unlock(mm);
 }
 
@@ -409,7 +430,8 @@ static void __damon_va_prepare_access_check(struct mm_struct *mm,
 {
 	r->sampling_addr = damon_rand(r->ar.start, r->ar.end);
 
-	damon_va_mkold(mm, r->sampling_addr);
+	r->last_pmd = NULL;
+	damon_va_mkold(mm, r, r->sampling_addr);
 }
 
 static void damon_va_prepare_access_checks(struct damon_ctx *ctx)
@@ -434,11 +456,13 @@ struct damon_young_walk_private {
 	bool young;
 };
 
+#if 0
 static int damon_young_pmd_entry(pmd_t *pmd, unsigned long addr,
 		unsigned long next, struct mm_walk *walk)
 {
 	pte_t *pte;
 	pte_t ptent;
+	pmd_t pmde;
 	spinlock_t *ptl;
 	struct folio *folio;
 	struct damon_young_walk_private *priv = walk->private;
@@ -496,6 +520,7 @@ out:
 	pte_unmap_unlock(pte, ptl);
 	return 0;
 }
+#endif
 
 #ifdef CONFIG_HUGETLB_PAGE
 static int damon_young_hugetlb_entry(pte_t *pte, unsigned long hmask,
@@ -531,24 +556,70 @@ out:
 #define damon_young_hugetlb_entry NULL
 #endif /* CONFIG_HUGETLB_PAGE */
 
+#if 0
 static const struct mm_walk_ops damon_young_ops = {
 	.pmd_entry = damon_young_pmd_entry,
-	.hugetlb_entry = damon_young_hugetlb_entry,
+	/* .hugetlb_entry = damon_young_hugetlb_entry, */
 	.walk_lock = PGWALK_RDLOCK,
 };
+#endif
 
-static bool damon_va_young(struct mm_struct *mm, unsigned long addr,
-		unsigned long *folio_sz)
+static bool damon_va_young(struct mm_struct *mm, pmd_t *pmd,
+			   unsigned long addr, unsigned long *folio_sz)
 {
-	struct damon_young_walk_private arg = {
-		.folio_sz = folio_sz,
-		.young = false,
-	};
+	bool young = false;
+	unsigned long pmd_start = addr & PMD_MASK;
+	unsigned long pmd_end = pmd_start + PMD_SIZE;
+	struct vm_area_struct *vma;
+	spinlock_t *ptl;
+	pte_t ptent, *pte;
+	struct folio *folio;
+	pmd_t pmde;
+
+	if (!pmd || !pmd_val(*pmd))
+		goto out;
 
 	mmap_read_lock(mm);
-	walk_page_range(mm, addr, addr + 1, &damon_young_ops, &arg);
+	/* walk_page_range(mm, addr, addr + 1, &damon_young_ops, &arg); */
+	vma = find_vma(mm, addr);
+	if (!vma)
+		goto unlock;
+
+	if (!(vma->vm_start <= pmd_start && vma->vm_end >= pmd_end))
+		goto check_pte;
+
+	pmde = pmdp_get(pmd);
+	folio = damon_get_folio(pmd_pfn(pmde));
+	if (!folio)
+		goto unlock;
+
+	if (pmd_young(pmde) || !folio_test_idle(folio) ||
+			mmu_notifier_test_young(mm, addr))
+		young = true;
+	*folio_sz = folio_size(folio);
+	folio_put(folio);
+	goto unlock;
+check_pte:
+	pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!pte)
+		goto unlock;
+	ptent = ptep_get(pte);
+	if (!pte_present(ptent))
+		goto pte_unmap;
+	folio = damon_get_folio(pte_pfn(ptent));
+	if (!folio)
+		goto pte_unmap;
+	if (pte_young(ptent) || !folio_test_idle(folio) ||
+			mmu_notifier_test_young(mm, addr))
+		young = true;
+	*folio_sz = folio_size(folio);
+	folio_put(folio);
+pte_unmap:
+	pte_unmap_unlock(pte, ptl);
+unlock:
 	mmap_read_unlock(mm);
-	return arg.young;
+out:
+	return young;
 }
 
 /*
@@ -577,10 +648,12 @@ static void __damon_va_check_access(struct mm_struct *mm,
 		return;
 	}
 
-	last_accessed = damon_va_young(mm, r->sampling_addr, &last_folio_sz);
+	last_accessed = damon_va_young(mm, r->last_pmd, r->sampling_addr,
+				       &last_folio_sz);
 	damon_update_region_access_rate(r, last_accessed, attrs);
 
 	last_addr = r->sampling_addr;
+	r->last_pmd = NULL;
 }
 
 static unsigned int damon_va_check_accesses(struct damon_ctx *ctx)

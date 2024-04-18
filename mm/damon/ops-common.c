@@ -53,7 +53,6 @@ void damon_ptep_mkold(pte_t *pte, struct vm_area_struct *vma, unsigned long addr
 
 void damon_pmdp_mkold(pmd_t *pmd, struct vm_area_struct *vma, unsigned long addr)
 {
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	struct folio *folio = damon_get_folio(pmd_pfn(pmdp_get(pmd)));
 
 	if (!folio)
@@ -64,7 +63,6 @@ void damon_pmdp_mkold(pmd_t *pmd, struct vm_area_struct *vma, unsigned long addr
 
 	folio_set_idle(folio);
 	folio_put(folio);
-#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 }
 
 #define DAMON_MAX_SUBSCORE	(100)

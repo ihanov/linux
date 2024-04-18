@@ -134,6 +134,7 @@ struct damon_region *damon_new_region(unsigned long start, unsigned long end)
 
 	region->age = 0;
 	region->last_nr_accesses = 0;
+	region->last_pmd = NULL;
 
 	return region;
 }
